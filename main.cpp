@@ -1,21 +1,3 @@
-/*
- Very small file manager for X11 (C++)
- Minimal dependencies: X11, POSIX (dirent.h, unistd.h)
- Features:
-  - Lists files in current directory
-  - Move selection with Up/Down keys
-  - Enter: if directory -> cd into it; else -> tries to open with xdg-open (fallback to less)
-  - Backspace: go up (cd ..)
-  - q: quit
-
- Compile:
-   g++ mini_x11_file_manager.cpp -o mini_fm -lX11
- Run:
-   ./mini_fm
-
- Notes: very small educational example. On Minix you may need to adjust the open command
- (xdg-open may not exist). Also make sure X server is running and X11 development headers/libs installed.
-*/
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
