@@ -1,26 +1,7 @@
 /*
  * minix_xfm.c
  * Simple X11 file manager for Minix 3.4.0
- * Targeted to compile with old gcc (3.2.0) and Xlib.
- *
- * Features:
- *  - Show files in current directory
- *  - Click to select, double-click to open (runs external viewer/terminal)
- *  - Enter directories and go up ("..")
- *  - Very small and portable C (no C99 features)
- *
- * Compile (example):
- *   gcc -O2 -o minix_xfm minix_xfm.c -lX11
- *
- * Notes for Minix 3.4.0 / old toolchain:
- *  - Avoids modern APIs and fancy libraries (no Xft, no GTK)
- *  - Uses basic Xlib calls and POSIX dirent/stat
- *  - External viewer is configurable by environment variable FILE_VIEWER
- *    default: "xterm -e vi" (if xterm isn't available, adjust)
- *
- * Limitations:
- *  - Not feature-complete; intended as a starting point you can extend
- *  - No file icons, no context menu, low-level text rendering
+ * ANSI C version compatible with old compilers
  */
 
 #include <stdio.h>
@@ -33,9 +14,11 @@
 #include <errno.h>
 #include <time.h>
 #include <signal.h>
+#include <sys/wait.h>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/keysym.h>
 
 #define WINDOW_W 800
 #define WINDOW_H 600
@@ -69,9 +52,18 @@ static char cwd[1024];
 static Time last_click_time = 0;
 static int last_click_index = -1;
 
-/* External viewer command (space-separated words) */
+/* External viewer command */
 #define DEFAULT_VIEWER "xterm -e vi"
 static char *viewer_argv[16];
+
+/* Forward declarations */
+static void setup_viewer(void);
+static void read_dir(const char *path);
+static void draw_list(void);
+static void open_entry(int idx);
+static int y_to_index(int y);
+static void handle_event(XEvent *ev);
+static void sigchld_handler(int sig);
 
 /* Utility: set viewer argv from env or default */
 static void setup_viewer(void)
@@ -90,7 +82,7 @@ static void setup_viewer(void)
     }
 
     p = strtok(buf, " \t");
-    while (p && i < (int)(sizeof(viewer_argv)/sizeof(viewer_argv[0]) - 1)) {
+    while (p != NULL && i < 15) {
         viewer_argv[i] = strdup(p);
         i++;
         p = strtok(NULL, " \t");
@@ -106,11 +98,14 @@ static void read_dir(const char *path)
     struct stat st;
     Entry *tmp;
     int cap = 0;
+    int i;
+    char full[1024];
 
-    /* free old */
-    if (entries) {
-        int i;
-        for (i = 0; i < nentries; i++) free(entries[i].name);
+    /* free old entries */
+    if (entries != NULL) {
+        for (i = 0; i < nentries; i++) {
+            free(entries[i].name);
+        }
         free(entries);
         entries = NULL;
         nentries = 0;
@@ -126,12 +121,17 @@ static void read_dir(const char *path)
     if (strcmp(path, "/") != 0) {
         cap = 16;
         entries = (Entry*)malloc(sizeof(Entry) * cap);
+        if (entries == NULL) return;
         entries[0].name = strdup("..");
         entries[0].is_dir = 1;
         nentries = 1;
     } else {
         cap = 16;
         entries = (Entry*)malloc(sizeof(Entry) * cap);
+        if (entries == NULL) {
+            closedir(d);
+            return;
+        }
         nentries = 0;
     }
 
@@ -149,15 +149,16 @@ static void read_dir(const char *path)
         entries[nentries].name = strdup(de->d_name);
 
         /* determine if directory */
-        {
-            char full[1024];
-            if (path[strlen(path)-1] == '/')
-                sprintf(full, "%s%s", path, de->d_name);
-            else
-                sprintf(full, "%s/%s", path, de->d_name);
+        if (path[strlen(path)-1] == '/') {
+            sprintf(full, "%s%s", path, de->d_name);
+        } else {
+            sprintf(full, "%s/%s", path, de->d_name);
+        }
 
-            if (lstat(full, &st) == 0 && S_ISDIR(st.st_mode)) entries[nentries].is_dir = 1;
-            else entries[nentries].is_dir = 0;
+        if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+            entries[nentries].is_dir = 1;
+        } else {
+            entries[nentries].is_dir = 0;
         }
 
         nentries++;
@@ -171,6 +172,7 @@ static void draw_list(void)
     int i;
     int lines = LIST_H / LINE_HEIGHT;
     char display[1024];
+    int y;
 
     /* clear */
     XSetForeground(dpy, gc, white_pixel);
@@ -178,15 +180,19 @@ static void draw_list(void)
 
     XSetForeground(dpy, gc, black_pixel);
     for (i = 0; i < nentries && i < lines; i++) {
-        int y = LIST_Y + i * LINE_HEIGHT + fontinfo->ascent;
+        y = LIST_Y + i * LINE_HEIGHT + fontinfo->ascent;
         if (i == selected) {
             /* draw selection rectangle */
-            XSetForeground(dpy, gc, 0xAAAAAA); /* light gray, may be ignored on old visuals */
-            XFillRectangle(dpy, win, gc, LIST_X, LIST_Y + i * LINE_HEIGHT, LIST_W, LINE_HEIGHT);
+            XSetForeground(dpy, gc, 0xAAAAAA);
+            XFillRectangle(dpy, win, gc, LIST_X, LIST_Y + i * LINE_HEIGHT, 
+                          LIST_W, LINE_HEIGHT);
             XSetForeground(dpy, gc, black_pixel);
         }
-        if (entries[i].is_dir) sprintf(display, "%s/", entries[i].name);
-        else sprintf(display, "%s", entries[i].name);
+        if (entries[i].is_dir) {
+            sprintf(display, "%s/", entries[i].name);
+        } else {
+            sprintf(display, "%s", entries[i].name);
+        }
         XDrawString(dpy, win, gc, LIST_X + 4, y, display, strlen(display));
     }
 
@@ -197,13 +203,19 @@ static void draw_list(void)
 /* Open a file or change directory */
 static void open_entry(int idx)
 {
+    char newpath[1024];
+    char filepath[1024];
+    char *p;
+    int pid;
+    int i;
+    char *argv[20];
+    
     if (idx < 0 || idx >= nentries) return;
 
     if (entries[idx].is_dir) {
         /* change directory */
-        char newpath[1024];
         if (strcmp(entries[idx].name, "..") == 0) {
-            char *p = strrchr(cwd, '/');
+            p = strrchr(cwd, '/');
             if (!p || p == cwd) {
                 /* go to root */
                 strcpy(cwd, "/");
@@ -211,8 +223,11 @@ static void open_entry(int idx)
                 *p = '\0';
             }
         } else {
-            if (strcmp(cwd, "/") == 0) sprintf(newpath, "/%s", entries[idx].name);
-            else sprintf(newpath, "%s/%s", cwd, entries[idx].name);
+            if (strcmp(cwd, "/") == 0) {
+                sprintf(newpath, "/%s", entries[idx].name);
+            } else {
+                sprintf(newpath, "%s/%s", cwd, entries[idx].name);
+            }
             strncpy(cwd, newpath, sizeof(cwd)-1);
             cwd[sizeof(cwd)-1] = '\0';
         }
@@ -221,24 +236,26 @@ static void open_entry(int idx)
         draw_list();
     } else {
         /* open file with configured viewer */
-        int pid = fork();
+        pid = fork();
         if (pid == 0) {
             /* child */
-            char filepath[1024];
-            if (strcmp(cwd, "/") == 0) sprintf(filepath, "/%s", entries[idx].name);
-            else sprintf(filepath, "%s/%s", cwd, entries[idx].name);
+            if (strcmp(cwd, "/") == 0) {
+                sprintf(filepath, "/%s", entries[idx].name);
+            } else {
+                sprintf(filepath, "%s/%s", cwd, entries[idx].name);
+            }
 
             /* assemble argv: viewer_argv + filepath + NULL */
-            int i;
-            char *argv[20];
-            for (i = 0; viewer_argv[i] != NULL && i < 15; i++) argv[i] = viewer_argv[i];
+            for (i = 0; viewer_argv[i] != NULL && i < 15; i++) {
+                argv[i] = viewer_argv[i];
+            }
             argv[i] = filepath;
             argv[i+1] = NULL;
 
             /* detach from X, exec viewer */
             setsid();
             execvp(argv[0], argv);
-            /* if exec fails, try /bin/sh -c "viewer path" */
+            /* if exec fails, try /bin/sh */
             execlp("/bin/sh", "sh", "-c", viewer_argv[0], (char*)NULL);
             /* failed: exit child */
             _exit(127);
@@ -262,16 +279,23 @@ static int y_to_index(int y)
 /* Handle X events */
 static void handle_event(XEvent *ev)
 {
+    int idx;
+    Time ct;
+    KeySym ks;
+    char buf[16];
+    int len;
+    
     if (ev->type == Expose) {
         draw_list();
     } else if (ev->type == ButtonPress) {
-        int idx = y_to_index(ev->xbutton.y);
-        Time ct = ev->xbutton.time;
+        idx = y_to_index(ev->xbutton.y);
+        ct = ev->xbutton.time;
         if (idx >= 0 && idx < nentries) {
             selected = idx;
             draw_list();
             /* detect double click: same index and within 400 ms */
-            if (last_click_index == idx && last_click_time != 0 && (ct - last_click_time) <= 400) {
+            if (last_click_index == idx && last_click_time != 0 && 
+                (ct - last_click_time) <= 400) {
                 open_entry(idx);
                 last_click_time = 0;
                 last_click_index = -1;
@@ -281,9 +305,7 @@ static void handle_event(XEvent *ev)
             }
         }
     } else if (ev->type == KeyPress) {
-        KeySym ks;
-        char buf[16];
-        int len = XLookupString(&ev->xkey, buf, sizeof(buf), &ks, NULL);
+        len = XLookupString(&ev->xkey, buf, sizeof(buf), &ks, NULL);
         if (len > 0) {
             if (buf[0] == 'q' || buf[0] == 'Q') {
                 /* quit */
@@ -294,10 +316,10 @@ static void handle_event(XEvent *ev)
             }
         } else {
             /* arrow keys */
-            if (ev->xkey.keycode == XKeysymToKeycode(dpy, XK_Up)) {
+            if (ks == XK_Up) {
                 if (selected > 0) selected--;
                 draw_list();
-            } else if (ev->xkey.keycode == XKeysymToKeycode(dpy, XK_Down)) {
+            } else if (ks == XK_Down) {
                 if (selected < nentries-1) selected++;
                 draw_list();
             }
@@ -308,7 +330,9 @@ static void handle_event(XEvent *ev)
 static void sigchld_handler(int sig)
 {
     /* reap children to avoid zombies */
-    while (waitpid(-1, NULL, WNOHANG) > 0) ;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+        /* empty */
+    }
 }
 
 int main(int argc, char **argv)
@@ -319,7 +343,9 @@ int main(int argc, char **argv)
     int i;
 
     /* initial cwd */
-    if (getcwd(cwd, sizeof(cwd)) == NULL) strcpy(cwd, "/");
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        strcpy(cwd, "/");
+    }
 
     setup_viewer();
 
@@ -336,22 +362,27 @@ int main(int argc, char **argv)
     black_pixel = BlackPixel(dpy, screen_num);
     white_pixel = WhitePixel(dpy, screen_num);
 
-    win = XCreateSimpleWindow(dpy, RootWindow(dpy, screen_num), 0, 0, WINDOW_W, WINDOW_H, 1, black_pixel, white_pixel);
+    win = XCreateSimpleWindow(dpy, RootWindow(dpy, screen_num), 
+                             0, 0, WINDOW_W, WINDOW_H, 1, 
+                             black_pixel, white_pixel);
     XSelectInput(dpy, win, ExposureMask | ButtonPressMask | KeyPressMask);
     XStoreName(dpy, win, "minix_xfm");
     XMapWindow(dpy, win);
 
     fontinfo = XLoadQueryFont(dpy, "fixed");
-    if (!fontinfo) fontinfo = XLoadQueryFont(dpy, "6x13");
     if (!fontinfo) {
-        fprintf(stderr, "Warning: couldn't load font, trying XLoadQueryFont(NULL)\n");
-        fontinfo = XLoadQueryFont(dpy, "fixed");
+        fontinfo = XLoadQueryFont(dpy, "6x13");
+    }
+    if (!fontinfo) {
+        fprintf(stderr, "Warning: couldn't load font\n");
+        /* Continue with default font */
+        fontinfo = XQueryFont(dpy, XGContextFromGC(DefaultGC(dpy, screen_num)));
     }
 
     gc = XCreateGC(dpy, win, valuemask, &values);
-    XSetFont(dpy, gc, fontinfo->fid);
-
-    /* set event mask for keyboard arrows: we rely on KeyPress */
+    if (fontinfo) {
+        XSetFont(dpy, gc, fontinfo->fid);
+    }
 
     /* signal handler for children */
     signal(SIGCHLD, sigchld_handler);
@@ -367,4 +398,3 @@ int main(int argc, char **argv)
     XCloseDisplay(dpy);
     return 0;
 }
-
