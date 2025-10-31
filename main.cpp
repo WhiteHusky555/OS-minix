@@ -1,165 +1,370 @@
+/*
+ * minix_xfm.c
+ * Simple X11 file manager for Minix 3.4.0
+ * Targeted to compile with old gcc (3.2.0) and Xlib.
+ *
+ * Features:
+ *  - Show files in current directory
+ *  - Click to select, double-click to open (runs external viewer/terminal)
+ *  - Enter directories and go up ("..")
+ *  - Very small and portable C (no C99 features)
+ *
+ * Compile (example):
+ *   gcc -O2 -o minix_xfm minix_xfm.c -lX11
+ *
+ * Notes for Minix 3.4.0 / old toolchain:
+ *  - Avoids modern APIs and fancy libraries (no Xft, no GTK)
+ *  - Uses basic Xlib calls and POSIX dirent/stat
+ *  - External viewer is configurable by environment variable FILE_VIEWER
+ *    default: "xterm -e vi" (if xterm isn't available, adjust)
+ *
+ * Limitations:
+ *  - Not feature-complete; intended as a starting point you can extend
+ *  - No file icons, no context menu, low-level text rendering
+ */
 
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <pwd.h>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <vector>
-#include <string>
-#include <algorithm>
+#include <sys/types.h>
+#include <errno.h>
+#include <time.h>
+#include <signal.h>
 
-using namespace std;
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
 
-struct Entry {
-    string name;
-    bool is_dir;
-};
+#define WINDOW_W 800
+#define WINDOW_H 600
+#define MARGIN 8
+#define LINE_HEIGHT 18
+#define LIST_X (MARGIN)
+#define LIST_Y (MARGIN)
+#define LIST_W (WINDOW_W - 2*MARGIN)
+#define LIST_H (WINDOW_H - 2*MARGIN)
 
-static vector<Entry> entries;
-static int sel = 0;
-static int offset = 0;
+/* Simple entry structure */
+typedef struct Entry {
+    char *name;
+    int is_dir;
+} Entry;
 
-void read_dir(const char* path) {
-    entries.clear();
-    DIR* d = opendir(path);
-    if (!d) return;
-    struct dirent* e;
-    while ((e = readdir(d))) {
-        string n(e->d_name);
-        if (n == ".") continue;
-        struct stat st;
-        if (stat(n.c_str(), &st) == 0) {
-            bool isd = S_ISDIR(st.st_mode);
-            entries.push_back({n, isd});
-        } else {
-            entries.push_back({n, false});
-        }
+/* Global state */
+static Display *dpy;
+static int screen_num;
+static Window win;
+static GC gc;
+static XFontStruct *fontinfo;
+static unsigned long black_pixel, white_pixel;
+
+static Entry *entries = NULL;
+static int nentries = 0;
+static int selected = -1;
+static char cwd[1024];
+
+/* Double-click detection */
+static Time last_click_time = 0;
+static int last_click_index = -1;
+
+/* External viewer command (space-separated words) */
+#define DEFAULT_VIEWER "xterm -e vi"
+static char *viewer_argv[16];
+
+/* Utility: set viewer argv from env or default */
+static void setup_viewer(void)
+{
+    char *env = getenv("FILE_VIEWER");
+    char buf[512];
+    char *p;
+    int i = 0;
+
+    if (env && env[0] != '\0') {
+        strncpy(buf, env, sizeof(buf)-1);
+        buf[sizeof(buf)-1] = '\0';
+    } else {
+        strncpy(buf, DEFAULT_VIEWER, sizeof(buf)-1);
+        buf[sizeof(buf)-1] = '\0';
     }
-    closedir(d);
-    sort(entries.begin(), entries.end(), [](const Entry&a,const Entry&b){
-        if (a.is_dir != b.is_dir) return a.is_dir > b.is_dir; // dirs first
-        return a.name < b.name;
-    });
-    sel = 0; offset = 0;
+
+    p = strtok(buf, " \t");
+    while (p && i < (int)(sizeof(viewer_argv)/sizeof(viewer_argv[0]) - 1)) {
+        viewer_argv[i] = strdup(p);
+        i++;
+        p = strtok(NULL, " \t");
+    }
+    viewer_argv[i] = NULL;
 }
 
-int main(){
-    // Start in current directory
-    char cwd[4096];
-    if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, ".");
-    read_dir(cwd);
+/* Read directory contents into entries[] */
+static void read_dir(const char *path)
+{
+    DIR *d;
+    struct dirent *de;
+    struct stat st;
+    Entry *tmp;
+    int cap = 0;
 
-    Display* dpy = XOpenDisplay(NULL);
-    if (!dpy) {
-        fprintf(stderr, "Cannot open X display\n");
-        return 1;
+    /* free old */
+    if (entries) {
+        int i;
+        for (i = 0; i < nentries; i++) free(entries[i].name);
+        free(entries);
+        entries = NULL;
+        nentries = 0;
     }
-    int scr = DefaultScreen(dpy);
-    Window root = RootWindow(dpy, scr);
-    unsigned long white = WhitePixel(dpy, scr);
-    unsigned long black = BlackPixel(dpy, scr);
 
-    int winw = 600, winh = 400;
-    Window win = XCreateSimpleWindow(dpy, root, 100, 100, winw, winh, 1, black, white);
-    XStoreName(dpy, win, "mini-fm");
+    d = opendir(path);
+    if (!d) {
+        perror("opendir");
+        return;
+    }
 
-    XSelectInput(dpy, win, ExposureMask | KeyPressMask | ButtonPressMask | StructureNotifyMask);
-    XMapWindow(dpy, win);
+    /* include .. for going up, unless we are at root */
+    if (strcmp(path, "/") != 0) {
+        cap = 16;
+        entries = (Entry*)malloc(sizeof(Entry) * cap);
+        entries[0].name = strdup("..");
+        entries[0].is_dir = 1;
+        nentries = 1;
+    } else {
+        cap = 16;
+        entries = (Entry*)malloc(sizeof(Entry) * cap);
+        nentries = 0;
+    }
 
-    // Font
-    XFontStruct* font = XLoadQueryFont(dpy, "fixed");
-    if (!font) font = XLoadQueryFont(dpy, "-*-helvetica-*-r-*-*-12-*-*-*-*-*-*-*");
-    int fh = font ? font->ascent + font->descent : 14;
+    while ((de = readdir(d)) != NULL) {
+        /* skip '.' */
+        if (strcmp(de->d_name, ".") == 0) continue;
 
-    GC gc = XCreateGC(dpy, win, 0, NULL);
-    if (font) XSetFont(dpy, gc, font->fid);
+        if (nentries + 1 > cap) {
+            cap *= 2;
+            tmp = (Entry*)realloc(entries, sizeof(Entry) * cap);
+            if (!tmp) break; /* OOM */
+            entries = tmp;
+        }
 
-    Atom wmDelete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(dpy, win, &wmDelete, 1);
+        entries[nentries].name = strdup(de->d_name);
 
-    bool running = true;
-    XEvent ev;
-    while (running) {
-        XNextEvent(dpy, &ev);
-        if (ev.type == Expose || ev.type == ConfigureNotify) {
-            // redraw
-            XClearWindow(dpy, win);
-            // draw header with cwd
-            if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "?");
-            string header = string("cwd: ") + cwd + "  (q:quit, Enter:open, Backspace:up)";
-            XDrawString(dpy, win, gc, 6, fh, header.c_str(), header.size());
+        /* determine if directory */
+        {
+            char full[1024];
+            if (path[strlen(path)-1] == '/')
+                sprintf(full, "%s%s", path, de->d_name);
+            else
+                sprintf(full, "%s/%s", path, de->d_name);
 
-            int y = fh * 2;
-            int h = winh - y - 10;
-            int lines = h / fh;
-            for (int i = 0; i < lines; ++i) {
-                int idx = offset + i;
-                if (idx >= (int)entries.size()) break;
-                string s = entries[idx].name;
-                if (entries[idx].is_dir) s = string("[" ) + s + "]";
-                int x = 8;
-                int baseline = y + i * fh + font->ascent;
-                if (idx == sel) {
-                    // draw selection rectangle
-                    XFillRectangle(dpy, win, gc, x-4, y + i*fh - font->ascent/2, winw - 16, fh);
-                    XSetForeground(dpy, gc, white);
-                    XDrawString(dpy, win, gc, x, baseline, s.c_str(), s.size());
-                    XSetForeground(dpy, gc, black);
-                } else {
-                    XDrawString(dpy, win, gc, x, baseline, s.c_str(), s.size());
-                }
+            if (lstat(full, &st) == 0 && S_ISDIR(st.st_mode)) entries[nentries].is_dir = 1;
+            else entries[nentries].is_dir = 0;
+        }
+
+        nentries++;
+    }
+    closedir(d);
+}
+
+/* Draw the visible list */
+static void draw_list(void)
+{
+    int i;
+    int lines = LIST_H / LINE_HEIGHT;
+    char display[1024];
+
+    /* clear */
+    XSetForeground(dpy, gc, white_pixel);
+    XFillRectangle(dpy, win, gc, 0, 0, WINDOW_W, WINDOW_H);
+
+    XSetForeground(dpy, gc, black_pixel);
+    for (i = 0; i < nentries && i < lines; i++) {
+        int y = LIST_Y + i * LINE_HEIGHT + fontinfo->ascent;
+        if (i == selected) {
+            /* draw selection rectangle */
+            XSetForeground(dpy, gc, 0xAAAAAA); /* light gray, may be ignored on old visuals */
+            XFillRectangle(dpy, win, gc, LIST_X, LIST_Y + i * LINE_HEIGHT, LIST_W, LINE_HEIGHT);
+            XSetForeground(dpy, gc, black_pixel);
+        }
+        if (entries[i].is_dir) sprintf(display, "%s/", entries[i].name);
+        else sprintf(display, "%s", entries[i].name);
+        XDrawString(dpy, win, gc, LIST_X + 4, y, display, strlen(display));
+    }
+
+    /* draw cwd at bottom */
+    XDrawString(dpy, win, gc, LIST_X, WINDOW_H - MARGIN, cwd, strlen(cwd));
+}
+
+/* Open a file or change directory */
+static void open_entry(int idx)
+{
+    if (idx < 0 || idx >= nentries) return;
+
+    if (entries[idx].is_dir) {
+        /* change directory */
+        char newpath[1024];
+        if (strcmp(entries[idx].name, "..") == 0) {
+            char *p = strrchr(cwd, '/');
+            if (!p || p == cwd) {
+                /* go to root */
+                strcpy(cwd, "/");
+            } else {
+                *p = '\0';
             }
-        } else if (ev.type == KeyPress) {
-            KeySym ks = XLookupKeysym(&ev.xkey, 0);
-            if (ks == XK_q || ks == XK_Q) {
-                running = false;
-            } else if (ks == XK_Up) {
-                if (sel > 0) sel--;
-                if (sel < offset) offset = sel;
-                XClearWindow(dpy, win);
-                XEvent e2; e2.type = Expose; XSendEvent(dpy, win, False, ExposureMask, &e2);
-            } else if (ks == XK_Down) {
-                if (sel+1 < (int)entries.size()) sel++;
-                // adjust offset to keep selection visible
-                int lines = (winh - fh*2 - 10) / fh;
-                if (sel >= offset + lines) offset = sel - lines + 1;
-                XClearWindow(dpy, win);
-                XEvent e2; e2.type = Expose; XSendEvent(dpy, win, False, ExposureMask, &e2);
-            } else if (ks == XK_Return) {
-                if (entries.empty()) continue;
-                string target = entries[sel].name;
-                if (entries[sel].is_dir) {
-                    if (chdir(target.c_str()) == 0) {
-                        read_dir(".");
-                    }
-                } else {
-                    // try xdg-open, fallback to less
-                    string cmd = string("xdg-open '") + target + "' 2>/dev/null &";
-                    int r = system(cmd.c_str());
-                    if (r == -1) {
-                        string cmd2 = string("less '") + target + "' &";
-                        system(cmd2.c_str());
-                    }
-                }
-                XClearWindow(dpy, win);
-                XEvent e2; e2.type = Expose; XSendEvent(dpy, win, False, ExposureMask, &e2);
-            } else if (ks == XK_BackSpace) {
-                if (chdir("..") == 0) read_dir(".");
-                XClearWindow(dpy, win);
-                XEvent e2; e2.type = Expose; XSendEvent(dpy, win, False, ExposureMask, &e2);
-            }
-        } else if (ev.type == ClientMessage) {
-            if ((Atom)ev.xclient.data.l[0] == wmDelete) running = false;
+        } else {
+            if (strcmp(cwd, "/") == 0) sprintf(newpath, "/%s", entries[idx].name);
+            else sprintf(newpath, "%s/%s", cwd, entries[idx].name);
+            strncpy(cwd, newpath, sizeof(cwd)-1);
+            cwd[sizeof(cwd)-1] = '\0';
+        }
+        read_dir(cwd);
+        selected = -1;
+        draw_list();
+    } else {
+        /* open file with configured viewer */
+        int pid = fork();
+        if (pid == 0) {
+            /* child */
+            char filepath[1024];
+            if (strcmp(cwd, "/") == 0) sprintf(filepath, "/%s", entries[idx].name);
+            else sprintf(filepath, "%s/%s", cwd, entries[idx].name);
+
+            /* assemble argv: viewer_argv + filepath + NULL */
+            int i;
+            char *argv[20];
+            for (i = 0; viewer_argv[i] != NULL && i < 15; i++) argv[i] = viewer_argv[i];
+            argv[i] = filepath;
+            argv[i+1] = NULL;
+
+            /* detach from X, exec viewer */
+            setsid();
+            execvp(argv[0], argv);
+            /* if exec fails, try /bin/sh -c "viewer path" */
+            execlp("/bin/sh", "sh", "-c", viewer_argv[0], (char*)NULL);
+            /* failed: exit child */
+            _exit(127);
+        } else if (pid > 0) {
+            /* parent: don't wait */
+            return;
+        } else {
+            perror("fork");
         }
     }
+}
 
+/* Convert window Y to entry index */
+static int y_to_index(int y)
+{
+    int rel = y - LIST_Y;
+    if (rel < 0) return -1;
+    return rel / LINE_HEIGHT;
+}
+
+/* Handle X events */
+static void handle_event(XEvent *ev)
+{
+    if (ev->type == Expose) {
+        draw_list();
+    } else if (ev->type == ButtonPress) {
+        int idx = y_to_index(ev->xbutton.y);
+        Time ct = ev->xbutton.time;
+        if (idx >= 0 && idx < nentries) {
+            selected = idx;
+            draw_list();
+            /* detect double click: same index and within 400 ms */
+            if (last_click_index == idx && last_click_time != 0 && (ct - last_click_time) <= 400) {
+                open_entry(idx);
+                last_click_time = 0;
+                last_click_index = -1;
+            } else {
+                last_click_time = ct;
+                last_click_index = idx;
+            }
+        }
+    } else if (ev->type == KeyPress) {
+        KeySym ks;
+        char buf[16];
+        int len = XLookupString(&ev->xkey, buf, sizeof(buf), &ks, NULL);
+        if (len > 0) {
+            if (buf[0] == 'q' || buf[0] == 'Q') {
+                /* quit */
+                XCloseDisplay(dpy);
+                exit(0);
+            } else if (buf[0] == '\n' || buf[0] == '\r') {
+                if (selected >= 0) open_entry(selected);
+            }
+        } else {
+            /* arrow keys */
+            if (ev->xkey.keycode == XKeysymToKeycode(dpy, XK_Up)) {
+                if (selected > 0) selected--;
+                draw_list();
+            } else if (ev->xkey.keycode == XKeysymToKeycode(dpy, XK_Down)) {
+                if (selected < nentries-1) selected++;
+                draw_list();
+            }
+        }
+    }
+}
+
+static void sigchld_handler(int sig)
+{
+    /* reap children to avoid zombies */
+    while (waitpid(-1, NULL, WNOHANG) > 0) ;
+}
+
+int main(int argc, char **argv)
+{
+    XEvent ev;
+    unsigned long valuemask = 0;
+    XGCValues values;
+    int i;
+
+    /* initial cwd */
+    if (getcwd(cwd, sizeof(cwd)) == NULL) strcpy(cwd, "/");
+
+    setup_viewer();
+
+    /* read initial directory */
+    read_dir(cwd);
+
+    /* X init */
+    dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        fprintf(stderr, "Unable to open X display.\n");
+        return 1;
+    }
+    screen_num = DefaultScreen(dpy);
+    black_pixel = BlackPixel(dpy, screen_num);
+    white_pixel = WhitePixel(dpy, screen_num);
+
+    win = XCreateSimpleWindow(dpy, RootWindow(dpy, screen_num), 0, 0, WINDOW_W, WINDOW_H, 1, black_pixel, white_pixel);
+    XSelectInput(dpy, win, ExposureMask | ButtonPressMask | KeyPressMask);
+    XStoreName(dpy, win, "minix_xfm");
+    XMapWindow(dpy, win);
+
+    fontinfo = XLoadQueryFont(dpy, "fixed");
+    if (!fontinfo) fontinfo = XLoadQueryFont(dpy, "6x13");
+    if (!fontinfo) {
+        fprintf(stderr, "Warning: couldn't load font, trying XLoadQueryFont(NULL)\n");
+        fontinfo = XLoadQueryFont(dpy, "fixed");
+    }
+
+    gc = XCreateGC(dpy, win, valuemask, &values);
+    XSetFont(dpy, gc, fontinfo->fid);
+
+    /* set event mask for keyboard arrows: we rely on KeyPress */
+
+    /* signal handler for children */
+    signal(SIGCHLD, sigchld_handler);
+
+    /* main loop */
+    while (1) {
+        XNextEvent(dpy, &ev);
+        handle_event(&ev);
+    }
+
+    /* cleanup (unreachable) */
     XFreeGC(dpy, gc);
-    if (font) XFreeFont(dpy, font);
-    XDestroyWindow(dpy, win);
     XCloseDisplay(dpy);
     return 0;
 }
+
